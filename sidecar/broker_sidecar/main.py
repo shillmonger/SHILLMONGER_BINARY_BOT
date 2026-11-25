@@ -372,8 +372,12 @@ async def candles(
 def main() -> None:
     import uvicorn
 
-    host = os.environ.get("BROKER_SIDECAR_HOST", "127.0.0.1")
-    port = int(os.environ.get("BROKER_SIDECAR_PORT", "8790"))
+    # Platforms like Altare/Render inject PORT and route traffic to it; honor
+    # BROKER_SIDECAR_* overrides first, then PORT, then the local default.
+    host = os.environ.get("BROKER_SIDECAR_HOST") or (
+        "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1"
+    )
+    port = int(os.environ.get("BROKER_SIDECAR_PORT") or os.environ.get("PORT") or "8790")
     uvicorn.run("broker_sidecar.main:app", host=host, port=port, log_level="info")
 
 
