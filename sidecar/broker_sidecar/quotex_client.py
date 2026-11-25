@@ -49,6 +49,15 @@ def _host() -> Optional[str]:
     return os.environ.get("QUOTEX_HOST") or None
 
 
+def _proxies() -> Optional[dict[str, str]]:
+    """Optional egress proxy for Quotex — datacenter IPs are frequently
+    Cloudflare-challenged, so a residential proxy may be required."""
+    proxy = (os.environ.get("QUOTEX_PROXY") or "").strip()
+    if not proxy:
+        return None
+    return {"http": proxy, "https": proxy}
+
+
 def _otp_callback(session: BrokerSession):
     """pyquotex invokes this when the broker demands a 2FA code.
 
@@ -76,6 +85,7 @@ async def connect(session: BrokerSession, otp: Optional[str] = None) -> None:
         session.email,
         session.password,
         host=_host(),
+        proxies=_proxies(),
         lang="en",
         user_data_dir=profile_dir,
         on_otp_callback=_otp_callback(session),
