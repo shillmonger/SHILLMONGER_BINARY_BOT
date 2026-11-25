@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Logs (keep the folder)
+logs/*
+!logs/.gitkeep
+
+# Packaging
+*.zip
+
+# Local session/state files
+session.json
+*.session
+*.session-journal
