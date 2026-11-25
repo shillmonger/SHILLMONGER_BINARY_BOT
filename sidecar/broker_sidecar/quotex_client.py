@@ -105,7 +105,12 @@ async def connect(session: BrokerSession, otp: Optional[str] = None) -> None:
         session.meta.requires_otp = True
         raise
     except Exception as exc:
-        raise BrokerAuthError(f"Quotex authentication failed: {exc}") from exc
+        detail = str(exc)
+        if "reason_phrase" in detail:
+            # pyquotex masks the real HTTP status behind a broken
+            # reason_phrase access — probe the landing page ourselves.
+            detail = f"{detail} (probe: {await _probe_status()})"
+        raise BrokerAuthError(f"Quotex authentication failed: {detail}") from exc
 
     if not ok:
         if "otp" in str(reason).lower() or "2fa" in str(reason).lower():
@@ -235,6 +240,22 @@ def _apply_profile(session: BrokerSession, profile: Any) -> None:
             if value is not None:
                 setattr(session.meta, attr, str(value))
                 break
+
+
+async def _probe_status() -> str:
+    """Fetch the broker landing page and report the real HTTP status —
+    pyquotex's login error path crashes on Response.reason_phrase and hides it."""
+    try:
+        from curl_cffi.requests import AsyncSession
+
+        host = _host() or "quotex.com"
+        async with AsyncSession(impersonate="chrome120", timeout=15) as s:
+            r = await s.get(f"https://{host}/en", proxies=_proxies())
+            server = r.headers.get("server", "?")
+            cf = r.headers.get("cf-mitigated", "-")
+            return f"HTTP {r.status_code} server={server} cf-mitigated={cf}"
+    except Exception as exc:
+        return f"probe failed: {type(exc).__name__}: {exc}"
 
 
 def _connect_timeout() -> float:
