@@ -39,7 +39,7 @@ except ImportError:  # python-dotenv optional — env vars still work
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import iqoption_client, quotex_client, telegram_service
+from . import iqoption_client, message_listener, quotex_client, telegram_service
 from .errors import (
     BrokerAuthError,
     BrokerError,
@@ -178,8 +178,14 @@ async def _run_connect(broker: str, session: BrokerSession, otp: Optional[str]) 
 async def lifespan(_app: FastAPI):
     logger.info("broker sidecar starting (secret %s)", "set" if _secret() else "MISSING")
     await telegram_service.auto_start_if_enabled()
+    await message_listener.auto_start_listener_if_enabled()
     yield
-    # Graceful shutdown: disconnect telegram + every live broker session.
+    # Graceful shutdown: stop the listener, then disconnect telegram +
+    # every live broker session.
+    try:
+        await message_listener.listener.stop()
+    except Exception:
+        logger.debug("listener shutdown failed", exc_info=True)
     try:
         await telegram_service.tg.disconnect()
     except Exception:
@@ -238,6 +244,31 @@ async def tg_groups() -> dict[str, Any]:
         ) from exc
     except telegram_service.TelegramError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+# ------------------------------------------------- message listener (Phase 3)
+# Ingestion only — the listener forwards raw Telegram events to the Next.js
+# backend. No signal parsing and no trade execution happens here.
+
+
+@app.get("/v1/telegram/listener/status", dependencies=[Depends(require_key)])
+async def listener_status() -> dict[str, Any]:
+    return message_listener.listener.to_dict()
+
+
+@app.post("/v1/telegram/listener/start", dependencies=[Depends(require_key)])
+async def listener_start() -> dict[str, Any]:
+    return await message_listener.listener.start()
+
+
+@app.post("/v1/telegram/listener/stop", dependencies=[Depends(require_key)])
+async def listener_stop() -> dict[str, Any]:
+    return await message_listener.listener.stop()
+
+
+@app.post("/v1/telegram/listener/restart", dependencies=[Depends(require_key)])
+async def listener_restart() -> dict[str, Any]:
+    return await message_listener.listener.restart()
 
 
 @app.post("/v1/{broker}/connect", response_model=ConnectResponse, dependencies=[Depends(require_key)])

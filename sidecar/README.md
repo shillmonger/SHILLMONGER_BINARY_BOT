@@ -96,6 +96,30 @@ Endpoints (same `X-Broker-Key` auth): `GET /v1/telegram/status`,
 authorization; it reports both states separately and masks the phone number.
 No message listening or signal parsing — groups only.
 
+## Message listener (Phase 3)
+
+`broker_sidecar/message_listener.py` attaches Telethon `NewMessage` /
+`MessageEdited` / `MessageDeleted` handlers to the SAME managed client —
+no second session. Events are normalized and POSTed to the Next.js
+internal ingest endpoint (`BINARY_INGEST_URL`) with the same
+HMAC-SHA256 `WORKER_HMAC_SECRET` scheme the SHILLMONGER worker uses.
+Broker routing happens server-side from `BINARY_PROVIDER` — the sidecar
+never sees or assigns brokers, and nothing here parses signals or trades.
+
+Env (see `.env.example`): `BINARY_INGEST_URL`, `WORKER_HMAC_SECRET`,
+`TELEGRAM_LISTENER_AUTO_START`, `LISTENER_FORWARD_TIMEOUT`.
+
+Endpoints (same `X-Broker-Key` auth):
+`GET /v1/telegram/listener/status`,
+`POST /v1/telegram/listener/start|stop|restart`.
+
+States: STOPPED / STARTING / RUNNING / RECONNECTING / DEGRADED / ERROR.
+The listener re-binds handlers automatically if the Telegram client is
+replaced, retries failed forwards with backoff, dedups recent deliveries,
+and reports received/forwarded/ingested/ignored/duplicates/failures
+counters. Deletion events are best-effort: Telegram only reports them
+reliably for channels/supergroups.
+
 ## Security notes
 
 - Bind localhost only; the secret fails closed (503) when unset.
