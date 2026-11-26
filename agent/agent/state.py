@@ -27,7 +27,8 @@ class AgentState(str, Enum):
 
 _TRANSITIONS = {
     AgentState.STOPPED: {AgentState.STARTING},
-    AgentState.STARTING: {AgentState.CONNECTED, AgentState.ERROR, AgentState.STOPPED},
+    AgentState.STARTING: {AgentState.CONNECTED, AgentState.DISCONNECTED,
+                          AgentState.ERROR, AgentState.STOPPED},
     AgentState.CONNECTED: {
         AgentState.DISCONNECTED,
         AgentState.ERROR,

@@ -18,6 +18,7 @@ from .diagnostics import diagnostics_summary, run_diagnostics
 from .health_server import create_app
 from .heartbeat import Heartbeat
 from .state import AgentState, StateMachine
+from .tunnel import TunnelClient
 
 logger = logging.getLogger("quotex_agent.service")
 
@@ -33,6 +34,7 @@ class AgentService:
         self._stop_event = asyncio.Event()
         self._diagnostics_cache: Optional[dict] = None
         self._diagnostics_at = 0.0
+        self.tunnel: Optional[TunnelClient] = None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -44,6 +46,7 @@ class AgentService:
         try:
             self.state_dir_prepare()
             await self._start_health_server()
+            self._start_tunnel_if_enabled()
             await self.heartbeat.start()
             checks = run_diagnostics(self.config)
             self._diagnostics_cache = diagnostics_summary(checks)
@@ -52,7 +55,12 @@ class AgentService:
             if failed:
                 logger.warning("diagnostics degraded: %s", ",".join(failed))
                 # Non-fatal: health endpoints still serve diagnostics.
-            self.state.transition(AgentState.CONNECTED, "core loops healthy")
+            self.state.transition(
+                AgentState.DISCONNECTED if self.config.tunnel_enabled
+                else AgentState.CONNECTED,
+                "awaiting tunnel" if self.config.tunnel_enabled
+                else "core loops healthy",
+            )
             logger.info("agent started id=%s bind=%s",
                         self.config.agent_id, self.config.health_bind)
         except Exception as exc:
@@ -62,6 +70,26 @@ class AgentService:
 
     def state_dir_prepare(self) -> None:
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
+
+    def _start_tunnel_if_enabled(self) -> None:
+        if not self.config.tunnel_enabled:
+            return
+        self.tunnel = TunnelClient(
+            self.config,
+            self.state,
+            on_restart=self.request_stop,
+        )
+        # Heartbeats ride the existing Heartbeat loop when the tunnel is up.
+        self.heartbeat._on_beat = self._beat_to_tunnel
+        self.tunnel.start()
+
+    async def _beat_to_tunnel(self) -> None:
+        if self.tunnel is not None and self.tunnel.connected:
+            await self.tunnel.send_event("HEARTBEAT", {
+                "agentId": self.config.agent_id,
+                "version": self.config.version,
+                "state": self.state.state.value,
+            })
 
     async def _start_health_server(self) -> None:
         app = create_app(
@@ -97,6 +125,11 @@ class AgentService:
             await self.heartbeat.stop()
         except Exception:
             logger.debug("heartbeat stop error (ignored)", exc_info=True)
+        if self.tunnel is not None:
+            try:
+                await self.tunnel.stop()
+            except Exception:
+                logger.debug("tunnel stop error (ignored)", exc_info=True)
         if self._server is not None:
             self._server.should_exit = True
         if self._server_task is not None:

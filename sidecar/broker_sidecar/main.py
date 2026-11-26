@@ -39,7 +39,13 @@ except ImportError:  # python-dotenv optional — env vars still work
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import iqoption_client, message_listener, quotex_client, telegram_service
+from . import (
+    agent_tunnel,
+    iqoption_client,
+    message_listener,
+    quotex_client,
+    telegram_service,
+)
 from .errors import (
     BrokerAuthError,
     BrokerError,
@@ -202,6 +208,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="broker-sidecar", version="1.0.0", lifespan=lifespan)
+app.include_router(agent_tunnel.router)
 
 
 @app.get("/health")
@@ -269,6 +276,43 @@ async def listener_stop() -> dict[str, Any]:
 @app.post("/v1/telegram/listener/restart", dependencies=[Depends(require_key)])
 async def listener_restart() -> dict[str, Any]:
     return await message_listener.listener.restart()
+
+
+# ------------------------------------------------------- Windows agent tunnel
+# The agent dials OUT to /v1/agent/tunnel (WebSocket). These HTTP routes are
+# for the Next.js dashboard/adapter only and require X-Broker-Key like every
+# other /v1/* endpoint. They expose status and two fixed verbs (PING, RESTART)
+# — never arbitrary commands.
+
+
+@app.get("/v1/agent/status", dependencies=[Depends(require_key)])
+async def agent_status() -> dict[str, Any]:
+    return agent_tunnel.manager.status()
+
+
+@app.post("/v1/agent/ping", dependencies=[Depends(require_key)])
+async def agent_ping() -> dict[str, Any]:
+    session = agent_tunnel.manager.session
+    if session is None:
+        raise HTTPException(status_code=503, detail="agent tunnel offline")
+    try:
+        result = await session.request("PING", timeout=10)
+    except Exception as exc:
+        raise HTTPException(status_code=504, detail=f"agent ping failed: {exc}") from exc
+    return {"ok": True, "result": result.get("result", result)}
+
+
+@app.post("/v1/agent/restart", dependencies=[Depends(require_key)])
+async def agent_restart() -> dict[str, Any]:
+    """Ask the agent to gracefully restart itself (fixed RESTART verb)."""
+    session = agent_tunnel.manager.session
+    if session is None:
+        raise HTTPException(status_code=503, detail="agent tunnel offline")
+    try:
+        result = await session.request("RESTART", timeout=10)
+    except Exception as exc:
+        raise HTTPException(status_code=504, detail=f"agent restart failed: {exc}") from exc
+    return {"ok": True, "result": result.get("result", result)}
 
 
 @app.post("/v1/{broker}/connect", response_model=ConnectResponse, dependencies=[Depends(require_key)])
