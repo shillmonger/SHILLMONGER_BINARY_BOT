@@ -33,3 +33,9 @@ class BrokerUnavailableError(BrokerError):
     """Library missing or broker unreachable."""
 
     code = "unavailable"
+
+
+class BrokerOrderError(BrokerError):
+    """Order placement rejected or failed at the broker."""
+
+    code = "order"

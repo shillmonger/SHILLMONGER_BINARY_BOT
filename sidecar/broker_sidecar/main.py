@@ -16,6 +16,7 @@ Run:  python -m broker_sidecar.main   (from BINARY_TRADING_BOTS/sidecar)
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import secrets
@@ -44,6 +45,7 @@ from . import (
     iqoption_client,
     message_listener,
     quotex_client,
+    session_restore,
     telegram_service,
 )
 from .errors import (
@@ -103,6 +105,15 @@ class OtpBody(BaseModel):
 
 class UserBody(BaseModel):
     userId: str = Field(min_length=1, max_length=64)
+
+
+class OrderBody(BaseModel):
+    userId: str = Field(min_length=1, max_length=64)
+    asset: str = Field(min_length=1, max_length=64)
+    direction: str = Field(min_length=3, max_length=8)  # CALL|PUT|BUY|SELL
+    amount: float = Field(gt=0, le=10000)
+    durationMinutes: int = Field(default=1, ge=1, le=60)
+    isOtc: bool = False
 
 
 class ConnectResponse(BaseModel):
@@ -180,11 +191,84 @@ async def _run_connect(broker: str, session: BrokerSession, otp: Optional[str]) 
 # ---------------------------------------------------------------- app
 
 
+async def _restore_broker_sessions() -> None:
+    """Rebuild in-memory broker sessions after a sidecar restart.
+
+    Pulls the restorable session list from the Next.js app and runs the
+    normal connect handshake for each. Runs as a background task so uvicorn
+    startup is never blocked; failures are logged, never fatal.
+    """
+    try:
+        sessions = await asyncio.to_thread(session_restore.fetch_restore_sessions)
+    except Exception as exc:
+        logger.warning("session restore fetch failed: %s", exc)
+        # One delayed retry — the app may still be booting.
+        await asyncio.sleep(30)
+        try:
+            sessions = await asyncio.to_thread(session_restore.fetch_restore_sessions)
+        except Exception as exc2:
+            logger.warning("session restore retry failed: %s", exc2)
+            return
+    if not sessions:
+        logger.info("session restore: nothing to restore")
+        return
+    logger.info("session restore: %d candidate session(s)", len(sessions))
+    for entry in sessions:
+        broker = str(entry.get("broker") or "")
+        user_id = str(entry.get("userId") or "")
+        email = str(entry.get("email") or "")
+        password = str(entry.get("password") or "")
+        if broker not in BROKERS or not user_id or not email or not password:
+            logger.warning("session restore: skipping malformed entry broker=%s", broker)
+            continue
+        existing = store.get(broker, user_id)
+        if existing and existing.meta.connected:
+            continue
+        body = ConnectBody(userId=user_id, email=email, password=password, accountMode="DEMO")
+        session = _get_or_create_session(body, broker)
+        result = None
+        for attempt in range(2):
+            async with session.lock:
+                result = await _run_connect(broker, session, None)
+            if result.connected or result.requiresOtp:
+                break
+            # Retry once for transient transport failures (DNS, timeouts,
+            # broker unreachable). Auth/credential errors are not retried.
+            err = str(result.error or "").lower()
+            transient = any(
+                k in err
+                for k in ("timed out", "timeout", "resolve", "connection", "unreachable", "502", "503")
+            )
+            if attempt == 0 and transient:
+                logger.info(
+                    "session restore: %s user=%s transient failure (%s) — retrying in 15s",
+                    broker, user_id, result.error,
+                )
+                await asyncio.sleep(15)
+                continue
+            break
+        if result.connected:
+            logger.info("session restore: %s user=%s connected", broker, user_id)
+        elif result.requiresOtp:
+            logger.warning(
+                "session restore: %s user=%s requires OTP — complete via UI",
+                broker, user_id,
+            )
+        else:
+            logger.warning(
+                "session restore: %s user=%s failed: %s",
+                broker, user_id, result.error,
+            )
+        await asyncio.sleep(2)  # gentle pacing for the brokers
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     logger.info("broker sidecar starting (secret %s)", "set" if _secret() else "MISSING")
     await telegram_service.auto_start_if_enabled()
     await message_listener.auto_start_listener_if_enabled()
+    if session_restore.enabled():
+        asyncio.create_task(_restore_broker_sessions())
     yield
     # Graceful shutdown: stop the listener, then disconnect telegram +
     # every live broker session.
@@ -411,6 +495,59 @@ async def candles(
         except BrokerError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"ok": True, "asset": asset, "period": period, "candles": data}
+
+
+# ------------------------------------------------------- live order routes
+# These place REAL orders on the broker — but only ever on the session's
+# PRACTICE/DEMO account (the clients are hard-pinned to PRACTICE at connect
+# time and REAL modes are rejected above). Callers must still enforce their
+# own per-user opt-in before hitting these endpoints.
+
+
+def _live_session(broker: str, user_id: str) -> BrokerSession:
+    session = store.get(broker, user_id)
+    if session is None or session.client is None:
+        raise HTTPException(status_code=404, detail="no active session")
+    mode = (session.meta.account_mode or "").upper()
+    if mode and mode not in DEMO_MODES:
+        raise HTTPException(
+            status_code=403,
+            detail=f"order blocked: session account mode is '{mode}', DEMO only",
+        )
+    return session
+
+
+@app.post("/v1/{broker}/order", dependencies=[Depends(require_key)])
+async def place_order(broker: str, body: OrderBody) -> dict[str, Any]:
+    mod = _broker(broker)
+    session = _live_session(broker, body.userId)
+    async with session.lock:
+        try:
+            result = await mod.place_order(
+                session,
+                asset=body.asset,
+                direction=body.direction,
+                amount=body.amount,
+                duration_minutes=body.durationMinutes,
+                is_otc=body.isOtc,
+            )
+        except BrokerError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, **result}
+
+
+@app.get("/v1/{broker}/order/{order_id}", dependencies=[Depends(require_key)])
+async def order_result(
+    broker: str, order_id: str, userId: str = Query(...)
+) -> dict[str, Any]:
+    mod = _broker(broker)
+    session = _live_session(broker, userId)
+    async with session.lock:
+        try:
+            result = await mod.get_order_result(session, order_id)
+        except BrokerError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, **result}
 
 
 def main() -> None:

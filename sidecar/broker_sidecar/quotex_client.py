@@ -258,6 +258,30 @@ async def _probe_status() -> str:
         return f"probe failed: {type(exc).__name__}: {exc}"
 
 
+# Live order placement is intentionally not implemented for Quotex yet —
+# the sidecar exposes the endpoint for symmetry but it returns
+# BrokerUnavailableError so callers degrade cleanly to simulation-only.
+
+
+async def place_order(
+    session: BrokerSession,
+    asset: str,
+    direction: str,
+    amount: float,
+    duration_minutes: int,
+    is_otc: bool = False,
+) -> dict[str, Any]:
+    raise BrokerUnavailableError(
+        "Live order placement is not supported for Quotex yet"
+    )
+
+
+async def get_order_result(session: BrokerSession, order_id: str) -> dict[str, Any]:
+    raise BrokerUnavailableError(
+        "Live order lookup is not supported for Quotex yet"
+    )
+
+
 def _connect_timeout() -> float:
     return float(os.environ.get("BROKER_CONNECT_TIMEOUT", "45"))
 
